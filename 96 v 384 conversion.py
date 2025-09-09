@@ -39,7 +39,7 @@ def compute_global_384_index(df: pd.DataFrame) -> pd.DataFrame:
         plate = row.get('Plate', np.nan)
         local = well_384_index.get(str(row.get('384 Well', '')).strip().upper(), None)
         if pd.notnull(plate) and local is not None:
-            plate_group = int((plate - 1) // 4)
+            plate_group = int((plate - 1) // 4)  # 4 x 96-well plates per 384
             return plate_group * 384 + local
         return None
 
@@ -49,14 +49,12 @@ def compute_global_384_index(df: pd.DataFrame) -> pd.DataFrame:
 def extract_sortable_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     Keep only rows that have Plate, 96 Well, and 384 Well populated.
-    (This mirrors your original intent and ensures stable reinsertion.)
     """
     return df[df[['Plate', '96 Well', '384 Well']].notnull().all(axis=1)].copy()
 
 def inject_sorted_back(original_df: pd.DataFrame, sorted_rows: pd.DataFrame) -> pd.DataFrame:
     """
-    Replaces only the sortable rows in their original positions with the newly-sorted ones.
-    Non-sortable rows remain untouched and in place.
+    Replace only the sortable rows in their original positions with the sorted ones.
     """
     sorted_iter = iter(sorted_rows.to_dict(orient='records'))
     result_rows = []
@@ -67,14 +65,14 @@ def inject_sorted_back(original_df: pd.DataFrame, sorted_rows: pd.DataFrame) -> 
             result_rows.append(row.to_dict())
     return pd.DataFrame(result_rows)
 
-# --- (old generic A1..H12 key kept for reference; no longer used) ---
+# (legacy parser kept for reference; not used by the new custom order)
 def sort_96_well_labels(well_label):
     match = re.match(r"([A-H])([0-9]{1,2})", str(well_label))
     if match:
         row_letter = match.group(1)
         col_number = int(match.group(2))
         return (row_letter, col_number)
-    return ("Z", 99)  # fallback
+    return ("Z", 99)
 
 # -----------------------------------------------------------------------------
 # Sorting toggle
@@ -87,10 +85,7 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
     sortable = extract_sortable_rows(df)
 
     if view_mode == '96-well layout':
-        # Ensure numeric plates so "10" doesn't come before "2"
         sortable['Plate'] = pd.to_numeric(sortable['Plate'], errors='coerce')
-
-        # Stable two-step: group by Plate, then apply custom position within plate
         sortable = (
             sortable
             .sort_values(['Plate'], kind='mergesort')
@@ -100,7 +95,6 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
         )
 
     elif view_mode == '384-well layout':
-        # Assumes compute_global_384_index already ran
         sortable = sortable.sort_values(by='Global_384_Position', kind='mergesort')
 
     else:
@@ -111,40 +105,78 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # Download helper
 # -----------------------------------------------------------------------------
-def download_link(df: pd.DataFrame, filename: str) -> BytesIO:
-    towrite = BytesIO()
-    df.to_excel(towrite, index=False, sheet_name="Sorted")
-    towrite.seek(0)
-    return towrite
+def to_excel_bytes(df: pd.DataFrame) -> BytesIO:
+    buf = BytesIO()
+    df.to_excel(buf, index=False, sheet_name="Sorted")
+    buf.seek(0)
+    return buf
 
 # -----------------------------------------------------------------------------
-# Header detection
+# Header detection (scans first 20 lines of preview)
 # -----------------------------------------------------------------------------
 REQUIRED_COLUMNS = {'96 Well', '384 Well', 'Plate'}
 
-def find_header_row(df: pd.DataFrame, required_columns: set) -> int | None:
-    for i in range(min(20, len(df))):
-        row = df.iloc[i]
+def find_header_row(preview_df: pd.DataFrame, required_columns: set) -> int | None:
+    for i in range(min(20, len(preview_df))):
+        row = preview_df.iloc[i]
         if required_columns.issubset(set(row.values)):
             return i
     return None
 
 # -----------------------------------------------------------------------------
+# Robust file readers with rewind
+# -----------------------------------------------------------------------------
+def read_preview(uploaded_file) -> pd.DataFrame:
+    """Read first 20 rows without assuming a header (CSV/Excel)."""
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(uploaded_file, header=None)
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, header=None, encoding="latin-1", engine="python")
+    else:
+        uploaded_file.seek(0)
+        try:
+            return pd.read_excel(uploaded_file, header=None, engine="openpyxl")
+        except Exception:
+            # fall back to default engine if openpyxl missing
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file, header=None)
+
+def read_with_header(uploaded_file, header_row: int) -> pd.DataFrame:
+    """Rewind and read with a chosen header row (CSV/Excel)."""
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(uploaded_file, header=header_row)
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, header=header_row, encoding="latin-1", engine="python")
+    else:
+        uploaded_file.seek(0)
+        try:
+            return pd.read_excel(uploaded_file, header=header_row, engine="openpyxl")
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file, header=header_row)
+
+# -----------------------------------------------------------------------------
 # Streamlit UI
 # -----------------------------------------------------------------------------
-st.title("Plate Layout Toggler: 96-Well ⇄ 384-Well (with custom 96-well order)")
+st.title("Plate Layout Toggler: 96-Well ⇄ 384-Well (with custom 96 order)")
 
 uploaded_file = st.file_uploader("Upload your Excel or CSV file", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
+    # Preview (no header)
+    preview_df = read_preview(uploaded_file)
     st.write("📄 Preview of first 20 rows:")
-    if uploaded_file.name.endswith(".csv"):
-        preview_df = pd.read_csv(uploaded_file, header=None)
-    else:
-        preview_df = pd.read_excel(uploaded_file, header=None)
-
     st.dataframe(preview_df.head(20))
 
+    # Header detection UI
     st.markdown("### 🔍 Header Row Detection")
     auto_header_row = find_header_row(preview_df, REQUIRED_COLUMNS)
     if auto_header_row is not None:
@@ -160,14 +192,11 @@ if uploaded_file is not None:
         step=1
     )
 
-    # Load full data using the selected header
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file, header=selected_row)
-    else:
-        df = pd.read_excel(uploaded_file, header=selected_row)
+    # Load full data with selected header (rewind before read)
+    df = read_with_header(uploaded_file, int(selected_row))
 
     if REQUIRED_COLUMNS.issubset(df.columns):
-        # Precompute 384 global index (used for the 384-well layout option)
+        # Precompute 384 index (used for the 384 layout)
         df = compute_global_384_index(df)
 
         view_mode = st.radio("Toggle view mode:", ["96-well layout", "384-well layout"], horizontal=True)
@@ -176,7 +205,11 @@ if uploaded_file is not None:
         st.write(f"### Displaying data in **{view_mode}**")
         st.dataframe(sorted_df.reset_index(drop=True))
 
-        output = download_link(sorted_df, "sorted_plate_layout.xlsx")
-        st.download_button("Download Sorted File", data=output, file_name="sorted_plate_layout.xlsx")
+        st.download_button(
+            "Download Sorted File",
+            data=to_excel_bytes(sorted_df),
+            file_name="sorted_plate_layout.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     else:
-        st.error(f"The selected row does not contain all required columns: {REQUIRED_COLUMNS}")
+        st.error(f"The selected header row does not contain all required columns: {REQUIRED_COLUMNS}")
