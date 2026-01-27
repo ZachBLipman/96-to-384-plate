@@ -91,7 +91,7 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
         sortable = (
             sortable
             .sort_values(['Plate'], kind='mergesort')
-            .assign(_pos=lambda x: x['96 Well'].map(pos96))  # ← Fixed: use lambda
+            .assign(_pos=lambda x: x['96 Well'].map(pos96))
             .sort_values(['Plate', '_pos'], ascending=[True, True], kind='mergesort')
             .drop(columns=['_pos'])
         )
@@ -103,6 +103,7 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
         return df
 
     return inject_sorted_back(df, sortable)
+
 # -----------------------------------------------------------------------------
 # Download helper
 # -----------------------------------------------------------------------------
@@ -336,11 +337,25 @@ if uploaded_file is not None:
             st.stop()
 
     if REQUIRED_COLUMNS.issubset(df.columns):
+        # Debug: Show actual column names after fuzzy matching
+        with st.expander("🔍 Debug Info - Column Names"):
+            st.write("Column names after fuzzy matching:", list(df.columns))
+        
         # Precompute 384 index (used for the 384 layout)
         df = compute_global_384_index(df)
 
         view_mode = st.radio("Toggle view mode:", ["96-well layout", "384-well layout"], horizontal=True)
+        
         sorted_df = sort_by_toggle(df, view_mode)
+        
+        # Debug: Show comparison of sorting
+        with st.expander("🔍 Debug Info - Sorting Verification"):
+            st.write("**First 10 rows with key columns:**")
+            if '96 Well' in sorted_df.columns and '384 Well' in sorted_df.columns and 'Plate' in sorted_df.columns:
+                st.write(sorted_df[['Plate', '96 Well', '384 Well']].head(10))
+            else:
+                st.write("Required columns not found!")
+                st.write("Available columns:", list(sorted_df.columns))
 
         st.write(f"### Displaying data in **{view_mode}**")
         st.dataframe(sorted_df.reset_index(drop=True))
