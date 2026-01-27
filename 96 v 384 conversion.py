@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 import re
+from difflib import SequenceMatcher
 
 # -----------------------------------------------------------------------------
 # Custom 96-well interleaved order (A/B, then C/D, then E/F, then G/H)
@@ -116,6 +117,117 @@ def to_excel_bytes(df: pd.DataFrame) -> BytesIO:
 # -----------------------------------------------------------------------------
 REQUIRED_COLUMNS = {'96 Well', '384 Well', 'Plate'}
 
+def normalize_header(header: str) -> str:
+    """
+    Normalize a header string for fuzzy matching.
+    Converts to lowercase, strips whitespace, removes common punctuation.
+    """
+    if pd.isna(header):
+        return ""
+    s = str(header).lower().strip()
+    # Remove common punctuation characters
+    for char in ['#', '-', '_', '.', '/', '\\', ':', ';', '(', ')', '[', ']']:
+        s = s.replace(char, '')
+    # Replace multiple spaces with single space
+    s = ' '.join(s.split())
+    return s
+
+def fuzzy_match_score(search_term: str, column: str) -> float:
+    """
+    Calculate fuzzy match score using difflib.
+    Returns a score from 0-100 for partial substring matching.
+    """
+    if not search_term or not column:
+        return 0.0
+
+    search_norm = normalize_header(search_term)
+    column_norm = normalize_header(column)
+
+    # Check for exact substring match
+    if search_norm in column_norm:
+        return 100.0
+
+    # Use difflib for partial ratio matching
+    # Compare search term against all substrings of column
+    if len(search_norm) > len(column_norm):
+        return SequenceMatcher(None, search_norm, column_norm).ratio() * 100
+
+    best_ratio = 0.0
+    for i in range(len(column_norm) - len(search_norm) + 1):
+        substring = column_norm[i:i + len(search_norm)]
+        ratio = SequenceMatcher(None, search_norm, substring).ratio()
+        best_ratio = max(best_ratio, ratio)
+
+    return best_ratio * 100
+
+def match_required_columns(row_values: list, required_columns: set) -> tuple[dict | None, list]:
+    """
+    Match required columns using fuzzy, case-insensitive logic.
+    Returns (mapping, warnings) where mapping is {canonical_name: matched_column_name}
+    or (None, warnings) if matching fails.
+    """
+    # Define search terms for each canonical column
+    search_terms = {
+        '96 Well': '96 well',
+        '384 Well': '384 well',
+        'Plate': 'plate'
+    }
+
+    mapping = {}
+    warnings = []
+
+    for canonical_name, search_term in search_terms.items():
+        candidates = []
+
+        for col in row_values:
+            if pd.isna(col):
+                continue
+
+            col_str = str(col)
+            score = fuzzy_match_score(search_term, col_str)
+
+            # Accept matches with score >= 70%
+            if score >= 70:
+                candidates.append((col_str, score, len(col_str)))
+
+        if len(candidates) == 0:
+            # No match found for this required column
+            return None, []
+
+        # Sort by score (descending), then by length (ascending for shortest name)
+        candidates.sort(key=lambda x: (-x[1], x[2]))
+        best_match = candidates[0][0]
+
+        # Warn if multiple high-scoring matches exist
+        if len(candidates) > 1 and candidates[1][1] >= 85:
+            other_matches = [c[0] for c in candidates[1:3]]
+            warnings.append(f"Multiple matches for '{canonical_name}': [{best_match!r}, {', '.join(repr(m) for m in other_matches)}]. Using {best_match!r}.")
+
+        mapping[canonical_name] = best_match
+
+    return mapping, warnings
+
+def find_header_row_fuzzy(preview_df: pd.DataFrame, required_columns: set) -> tuple[int | None, dict | None, list]:
+    """
+    Find header row with fuzzy matching.
+    Returns (row_index, column_mapping, warnings) or (None, None, []).
+    """
+    for i in range(min(20, len(preview_df))):
+        row = preview_df.iloc[i]
+        mapping, warnings = match_required_columns(row.values.tolist(), required_columns)
+        if mapping is not None:
+            return i, mapping, warnings
+    return None, None, []
+
+def rename_columns_to_canonical(df: pd.DataFrame, column_mapping: dict) -> pd.DataFrame:
+    """
+    Rename matched columns to canonical names.
+    column_mapping: {canonical_name: actual_column_name}
+    """
+    # Create inverse mapping: {actual_name: canonical_name}
+    inverse_mapping = {v: k for k, v in column_mapping.items()}
+    return df.rename(columns=inverse_mapping)
+
 def find_header_row(preview_df: pd.DataFrame, required_columns: set) -> int | None:
     for i in range(min(20, len(preview_df))):
         row = preview_df.iloc[i]
@@ -178,9 +290,16 @@ if uploaded_file is not None:
 
     # Header detection UI
     st.markdown("### 🔍 Header Row Detection")
-    auto_header_row = find_header_row(preview_df, REQUIRED_COLUMNS)
+    auto_header_row, column_mapping, warnings = find_header_row_fuzzy(preview_df, REQUIRED_COLUMNS)
     if auto_header_row is not None:
         st.success(f"Automatically detected header row at index {auto_header_row}")
+        if column_mapping:
+            # Show mapping if columns were renamed
+            renamed = {v: k for k, v in column_mapping.items() if v != k}
+            if renamed:
+                st.info(f"Mapped columns: {renamed}")
+        for warning in warnings:
+            st.warning(warning)
     else:
         st.warning("No header row detected automatically.")
 
@@ -194,6 +313,27 @@ if uploaded_file is not None:
 
     # Load full data with selected header (rewind before read)
     df = read_with_header(uploaded_file, int(selected_row))
+
+    # Apply fuzzy column matching if exact match fails
+    if not REQUIRED_COLUMNS.issubset(df.columns):
+        row_values = df.columns.tolist()
+        column_mapping, match_warnings = match_required_columns(row_values, REQUIRED_COLUMNS)
+
+        if column_mapping is not None:
+            # Show detected mapping
+            renamed = {v: k for k, v in column_mapping.items() if v != k}
+            if renamed:
+                st.info(f"Applied fuzzy matching: {renamed}")
+
+            # Display any warnings
+            for warning in match_warnings:
+                st.warning(warning)
+
+            # Rename columns to canonical names
+            df = rename_columns_to_canonical(df, column_mapping)
+        else:
+            st.error("Could not find columns matching: 96 well, 384 well, plate")
+            st.stop()
 
     if REQUIRED_COLUMNS.issubset(df.columns):
         # Precompute 384 index (used for the 384 layout)
