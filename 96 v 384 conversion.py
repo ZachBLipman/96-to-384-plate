@@ -55,16 +55,17 @@ def extract_sortable_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def inject_sorted_back(original_df: pd.DataFrame, sorted_rows: pd.DataFrame) -> pd.DataFrame:
     """
-    Replace only the sortable rows in their original positions with the sorted ones.
+    Return sorted rows first, then append any non-sortable rows at the end.
     """
-    sorted_iter = iter(sorted_rows.to_dict(orient='records'))
-    result_rows = []
-    for _, row in original_df.iterrows():
-        if pd.notnull(row.get('Plate')) and pd.notnull(row.get('96 Well')) and pd.notnull(row.get('384 Well')):
-            result_rows.append(next(sorted_iter))
-        else:
-            result_rows.append(row.to_dict())
-    return pd.DataFrame(result_rows)
+    # Get non-sortable rows (those missing any of the required columns)
+    non_sortable = original_df[~(
+        original_df[['Plate', '96 Well', '384 Well']].notnull().all(axis=1)
+    )].copy()
+    
+    # Concatenate sorted rows first, then non-sortable rows
+    result = pd.concat([sorted_rows, non_sortable], ignore_index=True)
+    
+    return result
 
 # (legacy parser kept for reference; not used by the new custom order)
 def sort_96_well_labels(well_label):
