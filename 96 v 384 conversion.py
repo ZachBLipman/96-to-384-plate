@@ -90,7 +90,7 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
         sortable = (
             sortable
             .sort_values(['Plate'], kind='mergesort')
-            .assign(_pos=sortable['96 Well'].map(pos96))
+            .assign(_pos=lambda x: x['96 Well'].map(pos96))  # ← Fixed: use lambda
             .sort_values(['Plate', '_pos'], ascending=[True, True], kind='mergesort')
             .drop(columns=['_pos'])
         )
@@ -102,7 +102,6 @@ def sort_by_toggle(df: pd.DataFrame, view_mode: str) -> pd.DataFrame:
         return df
 
     return inject_sorted_back(df, sortable)
-
 # -----------------------------------------------------------------------------
 # Download helper
 # -----------------------------------------------------------------------------
